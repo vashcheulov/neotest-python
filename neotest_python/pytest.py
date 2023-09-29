@@ -1,11 +1,17 @@
 from io import StringIO
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from .base import NeotestAdapter, NeotestError, NeotestResult, NeotestResultStatus
 
 import pytest
-from _pytest._code.code import ExceptionRepr
+from _pytest._code.code import (
+    ExceptionInfo,
+    ExceptionRepr,
+    ReprTraceback,
+    ReprEntry,
+    TerminalRepr,
+)
 from _pytest.terminal import TerminalReporter
 
 
@@ -34,14 +40,61 @@ class NeotestResultCollector:
 
         self.pytest_config: Optional["pytest.Config"] = None  # type: ignore
         self.results: Dict[str, NeotestResult] = {}
+        self.nodes: Dict[
+            Tuple[Union["pytest.TestReport", str], object], Node
+        ] = {}
 
-    def _get_short_output(
-        self, config: "pytest.Config", report: "pytest.TestReport"
-    ) -> Optional[str]:
+    def get_node(self, nodeid: str, worker_node: Optional[object] = None) -> "Node":
+        key = nodeid, worker_node
+
+        if key in self.nodes:
+            return self.nodes[key]
+
+        node = Node(nodeid, self)
+        self.nodes[key] = node
+
+        return node
+
+    def pytest_cmdline_main(self, config: "pytest.Config"):
+        self.pytest_config = config
+
+    def pytest_runtest_logreport(self, report: "pytest.TestReport") -> None:
+        # Local hack to handle xdist report order.
+        worker_node = getattr(report, "node", None)
+        node = self.get_node(report.nodeid, worker_node)
+        if report.passed:
+            if report.when == "call":
+                node.collect_passed(report)
+        elif report.failed:
+            node.collect_failed(report)
+        elif report.skipped:
+            node.collect_skipped(report)
+
+    def pytest_internalerror(self, excrepr: ExceptionRepr) -> None:
+        node = self.get_node("internal")
+        node.collect_error(excrepr)
+
+
+class Node:
+    def __init__(
+        self,
+        nodeid: Union[str, "pytest.TestReport"],
+        collector: "NeotestResultCollector",
+    ) -> None:
+        self.id = nodeid
+        self.collector = collector
+        self.file_path, *name_path = nodeid.split("::")
+        self.abs_path = str(Path(collector.pytest_config.rootdir, self.file_path))
+        *namespaces, test_name = name_path
+        valid_test_name, *params = test_name.split("[")  # ]
+        self.pos_id = "::".join([self.abs_path, *namespaces, valid_test_name])
+        self.params = params
+
+    def get_short_output(self, report: "pytest.TestReport") -> Optional[str]:
         buffer = StringIO()
         # Hack to get pytest to write ANSI codes
         setattr(buffer, "isatty", lambda: True)
-        reporter = TerminalReporter(config, buffer)
+        reporter = TerminalReporter(self.collector.pytest_config, buffer)
 
         # Taked from `_pytest.terminal.TerminalReporter
         msg = reporter._getfailureheadline(report)
@@ -57,85 +110,96 @@ class NeotestResultCollector:
         buffer.seek(0)
         return buffer.read()
 
-    def pytest_deselected(self, items: List["pytest.Item"]):
-        for report in items:
-            file_path, *name_path = report.nodeid.split("::")
-            abs_path = str(Path(self.pytest_config.rootdir, file_path))
-            *namespaces, test_name = name_path
-            valid_test_name, *params = test_name.split("[")  # ]
-            pos_id = "::".join([abs_path, *(namespaces), valid_test_name])
-            result = self.adapter.update_result(
-                self.results.get(pos_id),
-                {
-                    "short": None,
-                    "status": NeotestResultStatus.SKIPPED,
-                    "errors": [],
-                },
-            )
-            if not params:
-                self.stream(pos_id, result)
-            self.results[pos_id] = result
-
-    def pytest_cmdline_main(self, config: "pytest.Config"):
-        self.pytest_config = config
-
-    @pytest.hookimpl(hookwrapper=True)
-    def pytest_runtest_makereport(self, item: "pytest.Item", call: "pytest.CallInfo") -> None:
-        # pytest generates the report.outcome field in its internal
-        # pytest_runtest_makereport implementation, so call it first.  (We don't
-        # implement pytest_runtest_logreport because it doesn't have access to
-        # call.excinfo.)
-        outcome = yield
-        report = outcome.get_result()
-
-        if report.when != "call" and not (
-            report.outcome == "skipped" and report.when == "setup"
-        ):
-            return
-
-        file_path, *name_path = item.nodeid.split("::")
-        abs_path = str(Path(self.pytest_config.rootdir, file_path))
-        *namespaces, test_name = name_path
-        valid_test_name, *params = test_name.split("[")  # ]
-        pos_id = "::".join([abs_path, *namespaces, valid_test_name])
-
-        errors: List[NeotestError] = []
-        short = self._get_short_output(self.pytest_config, report)
-
-        msg_prefix = ""
-        if getattr(item, "callspec", None) is not None:
-            # Parametrized test
-            msg_prefix = f"[{item.callspec.id}] "
-        if report.outcome == "failed":
-            exc_repr = report.longrepr
-            # Test fails due to condition outside of test e.g. xfail
-            if isinstance(exc_repr, str):
-                errors.append({"message": msg_prefix + exc_repr, "line": None})
-            # Test failed internally
-            elif isinstance(exc_repr, ExceptionRepr):
-                error_message = exc_repr.reprcrash.message  # type: ignore
-                error_line = None
-                for traceback_entry in reversed(call.excinfo.traceback):
-                    if str(traceback_entry.path) == abs_path:
-                        error_line = traceback_entry.lineno
-                errors.append({"message": msg_prefix + error_message, "line": error_line})
-            else:
-                # TODO: Figure out how these are returned and how to represent
-                raise Exception(
-                    f"Unhandled error type ({type(exc_repr)}), please report to"
-                    " neotest-python repo"
-                )
-        result: NeotestResult = self.adapter.update_result(
-            self.results.get(pos_id),
+    def collect(
+        self,
+        short: Optional[str],
+        status: NeotestResultStatus,
+        errors: List[NeotestError],
+    ) -> None:
+        result = self.collector.adapter.update_result(
+            self.collector.results.get(self.pos_id),
             {
                 "short": short,
-                "status": NeotestResultStatus(report.outcome),
+                "status": status,
                 "errors": errors,
             },
         )
-        if not params:
-            self.stream(pos_id, result)
-        self.results[pos_id] = result
+        if not self.params:
+            self.collector.stream(self.pos_id, result)
+        self.collector.results[self.pos_id] = result
+
+    def collect_passed(self, report: "pytest.TestReport") -> None:
+        self.collect(
+            short=self.get_short_output(report),
+            status=NeotestResultStatus.PASSED,
+            errors=[],
+        )
+
+    def find_error_line(self, repr_traceback: ReprTraceback) -> Optional[int]:
+        error_line: Optional[int] = None
+        for repr_entry in reversed(repr_traceback.reprentries):
+            if not (isinstance(repr_entry, ReprEntry) and repr_entry.reprfileloc):
+                continue
+            location = repr_entry.reprfileloc
+            if self.file_path == location.path:
+                error_line = location.lineno - 1
+                break
+        return error_line
+
+    def collect_failed(self, report: "pytest.TestReport") -> None:
+        errors: List[NeotestError] = []
+        exc_repr: Union[
+            None, ExceptionInfo[BaseException], Tuple[str, int, str], str, TerminalRepr
+        ] = report.longrepr
+        # Test fails due to condition outside of test e.g. xfail
+        if isinstance(exc_repr, str):
+            errors.append({"message": exc_repr, "line": None})
+        # Test failed internally
+        elif isinstance(exc_repr, ReprTraceback):
+            error_line = self.find_error_line(exc_repr)
+            errors.append({"message": "error", "line": error_line})
+        elif isinstance(exc_repr, ExceptionRepr):
+            error_message = exc_repr.reprcrash.message  # type: ignore
+            error_line = self.find_error_line(exc_repr.reprtraceback)
+            errors.append({"message": error_message, "line": error_line})
+        else:
+            raise Exception(
+                f"Unhandled error type ({type(exc_repr)}), please report to"
+                " neotest-python repo"
+            )
+        self.collect(
+            short=self.get_short_output(report),
+            status=NeotestResultStatus.FAILED,
+            errors=errors,
+        )
+
+    def collect_error(self, exc_repr: ExceptionRepr) -> None:
+        errors: List[NeotestError] = []
+        error_message = exc_repr.reprcrash.message  # type: ignore
+        error_line = self.find_error_line(exc_repr.reprtraceback)
+        errors.append({"message": error_message, "line": error_line})
+
+        self.collect(
+            short=None,
+            status=NeotestResultStatus.FAILED,
+            errors=errors,
+        )
+
+    def collect_skipped(self, report: "pytest.TestReport") -> None:
+        errors: List[NeotestError] = []
+        exc_repr: Union[
+            None, ExceptionInfo[BaseException], Tuple[str, int, str], str, TerminalRepr
+        ] = report.longrepr
+
+        # consider if we should add this error
+        if isinstance(exc_repr, tuple):
+            errors.append({"message": exc_repr[2], "line": exc_repr[1]})
+
+        self.collect(
+            short=self.get_short_output(report),
+            status=NeotestResultStatus.SKIPPED,
+            errors=errors,
+        )
 
 
 class NeotestDebugpyPlugin:
